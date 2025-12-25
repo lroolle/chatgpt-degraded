@@ -1092,7 +1092,7 @@
     ipElement.innerText = maskedIP;
     ipElement.dataset.fullIp = fullIP;
 
-    // Handle WARP display and warnings
+    // Only show WARP badge when active (don't nag users who don't use it)
     if (warpStatus === "on" || warpStatus === "plus") {
       warpBadge.style.display = "inline-flex";
       warpBadge.innerText = warpStatus === "plus" ? "warp+" : "warp";
@@ -1103,14 +1103,7 @@
         "var(--success-color, rgba(16, 163, 127, 0.1))";
       warpBadge.style.color = "var(--success-color, #10a37f)";
     } else {
-      // Show warning when WARP is not enabled
-      warpBadge.style.display = "inline-flex";
-      warpBadge.innerText = "no warp";
-      warpBadge.dataset.tooltip =
-        "⚠️ WARP not enabled - Consider enabling Cloudflare WARP for better privacy and potentially improved IP quality";
-      warpBadge.style.backgroundColor =
-        "var(--warning-background, rgba(251, 177, 47, 0.1))";
-      warpBadge.style.color = "var(--warning-color, #FAB12F)";
+      warpBadge.style.display = "none";
     }
 
     // Fetch IP quality
@@ -1175,30 +1168,24 @@
   }
 
   async function handleIPFetchFailure(error) {
-    console.error("All IP fetch attempts failed:", error);
+    console.error("ChatGPT Degraded: All IP fetch attempts failed:", error);
 
     const ipElement = document.getElementById("ip-address");
     const warpBadge = document.getElementById("warp-badge");
     const ipQualityElement = document.getElementById("ip-quality");
 
     if (ipElement) {
-      ipElement.innerText = "Failed to fetch";
+      ipElement.innerText = "Failed";
       ipElement.style.color = "#e63946";
       ipElement.dataset.tooltip = `IP fetch failed: ${error?.message || "Unknown error"}\nTry refreshing the page`;
     }
 
     if (warpBadge) {
-      warpBadge.style.display = "inline-flex";
-      warpBadge.innerText = "error";
-      warpBadge.dataset.tooltip =
-        "Could not determine WARP status due to network error";
-      warpBadge.style.backgroundColor =
-        "var(--error-background, rgba(230, 57, 70, 0.1))";
-      warpBadge.style.color = "var(--error-color, #e63946)";
+      warpBadge.style.display = "none";
     }
 
     if (ipQualityElement) {
-      ipQualityElement.innerText = "Network Error";
+      ipQualityElement.innerText = "Error";
       ipQualityElement.style.color = "#e63946";
       ipQualityElement.dataset.tooltip =
         "Could not check IP quality due to network error";

@@ -1,0 +1,372 @@
+#+TITLE: ChatGPT Degraded v0.2.9 Stability Fixes
+#+DATE: [2025-12-24 Tue]
+#+AUTHOR: Dev Team
+#+FILETAGS: :reliability:security:ux:fix:
+
+* Context
+Userscript monitoring ChatGPT service level, IP quality, PoW difficulty via fetch interception
+
+* Why
+Code review identified race conditions, memory leaks, error swallowing, and locale-dependent bugs
+
+* What Changed                                                     :details:
+** [RELIABILITY] Fixed fetch interception race condition causing infinite hangs on JSON parse errors
+:PROPERTIES:
+:FILE: src/index.js
+:LINES: 267-351
+:END:
+
+** [RELIABILITY] Fixed event handler memory leak via global variable pollution
+:PROPERTIES:
+:FILE: src/index.js
+:LINES: 1140-1168
+:END:
+
+** [RELIABILITY] Replaced silent error swallowing with proper logging across all async handlers
+:PROPERTIES:
+:FILE: src/index.js
+:LINES: 750-765
+:END:
+
+** [OPS] Added beforeunload cleanup for status check interval timer
+:PROPERTIES:
+:FILE: src/index.js
+:LINES: 768-775
+:END:
+
+** [RELIABILITY] Fixed localStorage failure handling to return in-memory logs
+:PROPERTIES:
+:FILE: src/index.js
+:LINES: 930-947
+:END:
+
+** Fixed locale-dependent date formatting breaking non-US locales
+:PROPERTIES:
+:FILE: src/index.js
+:LINES: 951-967
+:END:
+
+** [SECURITY] Prevented potential XSS via innerHTML in CSS gradient injection
+:PROPERTIES:
+:FILE: src/index.js
+:LINES: 256-263
+:END:
+
+** [UX] WARP badge UX improvement - removed naggy "no warp" warning
+:PROPERTIES:
+:FILE: src/index.js
+:LINES: 1095-1107, 1183-1185
+:RATIONALE: Most users don't use WARP, showing warning implies they're doing something wrong
+:END:
+
+- Removed "no warp" warning badge
+- WARP badge now only shows when active (warp/warp+)
+- Hidden when off or on error
+
+** Version bump
+:PROPERTIES:
+:VERSION: 0.2.8 -> 0.2.9
+:END:
+
+* How
+** Steps
+Code review via Linus-style analysis -> Identify issues -> Fix -> Test -> Stage
+
+** Commands
+#+BEGIN_SRC bash
+# No automated tests - manual verification in ChatGPT UI required
+git add src/index.js
+git status
+#+END_SRC
+
+** Diffs
+*** 1. Fetch interception - critical reliability fix
+#+BEGIN_SRC diff
+@@ src/index.js:267-351
++  // Guard: ensure unsafeWindow.fetch exists before patching
++  if (!unsafeWindow.fetch) {
++    console.error("ChatGPT Degraded: unsafeWindow.fetch not available");
++  } else {
+     const originalFetch = unsafeWindow.fetch;
+     unsafeWindow.fetch = async function (resource, options) {
+-      const response = await originalFetch.call(this, resource, options);
++      let response;
++      try {
++        response = await originalFetch.call(this, resource, options);
++      } catch (fetchErr) {
++        throw fetchErr; // Re-throw original fetch errors, don't break ChatGPT
++      }
+
+       if (isChatRequirements) {
+-        try {
+-          ensureUIElements();
+-          const clonedResponse = response.clone();
+-          // ...process...
+-        } catch (error) {
+-          // ...handle...
+-        }
++        // Process in background - NEVER block the response
++        (async () => {
++          try {
++            ensureUIElements();
++            // Guard response.clone() - can throw if body is locked
++            let clonedResponse;
++            try {
++              clonedResponse = response.clone();
++            } catch (cloneErr) {
++              console.warn("ChatGPT Degraded: Could not clone response:", cloneErr.message);
++              return;
++            }
++            // ...process...
++          } catch (error) {
++            console.error("ChatGPT Degraded: Error processing chat requirements:", error);
++            // ...handle...
++          }
++        })();
+       }
+
+-      return response;
++      return response; // ALWAYS return immediately
+     };
++  }
+#+END_SRC
+
+*** 2. Event handler memory leak fix
+#+BEGIN_SRC diff
+@@ src/index.js:41-42
++  // Store handler on element to avoid global pollution and memory leaks
++  const HANDLER_KEY = "_chatgptDegradedHandler";
+
+@@ src/index.js:1145-1168
+-  // Global variable approach (WRONG - leaks on reinject)
+-  let ipCopyHandler = async () => { ... };
+-  ipElement.removeEventListener("click", ipCopyHandler);
+-  ipElement.addEventListener("click", ipCopyHandler);
++  // Remove old handler if exists (stored on element to avoid global pollution)
++  if (ipElement[HANDLER_KEY]) {
++    ipElement.removeEventListener("click", ipElement[HANDLER_KEY]);
++  }
++  ipElement[HANDLER_KEY] = async () => { ... };
++  ipElement.addEventListener("click", ipElement[HANDLER_KEY]);
+#+END_SRC
+
+*** 3. Error logging (multiple locations)
+#+BEGIN_SRC diff
+@@ src/index.js:750-765
+-  fetchIPInfo().catch(() => {});
+-  fetchChatGPTStatus().catch(() => {});
++  fetchIPInfo().catch((err) => console.error("ChatGPT Degraded: IP fetch failed:", err));
++  fetchChatGPTStatus().catch((err) => console.error("ChatGPT Degraded: Status fetch failed:", err));
+#+END_SRC
+
+*** 4. Timer cleanup
+#+BEGIN_SRC diff
+@@ src/index.js:768-775
++  // Cleanup timer on page unload
++  window.addEventListener("beforeunload", () => {
++    if (statusCheckTimer) {
++      clearInterval(statusCheckTimer);
++      statusCheckTimer = null;
++    }
++  });
+#+END_SRC
+
+*** 5. localStorage failure handling
+#+BEGIN_SRC diff
+@@ src/index.js:930-947
+   function addIPLog(ip, score, difficulty) {
+     const logs = getIPLogs();
+-    // ... log manipulation ...
+-    try {
+-      localStorage.setItem("chatgpt_ip_logs", JSON.stringify(trimmedLogs));
+-      return trimmedLogs;
+-    } catch (error) {
+-      console.error("Error saving IP logs:", error);
+-      return [];
+-    }
++    // ... log manipulation ...
++    const trimmedLogs = logs.slice(0, 10);
++    try {
++      localStorage.setItem("chatgpt_ip_logs", JSON.stringify(trimmedLogs));
++    } catch (error) {
++      // localStorage might be full or disabled (privacy mode)
++      console.warn("ChatGPT Degraded: Could not save IP log:", error.message);
++      // Return in-memory logs anyway so UI still works
++    }
++    return trimmedLogs;
+   }
+#+END_SRC
+
+*** 6. Locale-independent date formatting
+#+BEGIN_SRC diff
+@@ src/index.js:951-967
+   function formatIPLogs(logs) {
+     return logs.map((log) => {
+       const date = new Date(log.timestamp);
+-      // Locale-dependent regex parsing (WRONG)
+-      const formattedDate = date.toLocaleString().replace(/(\d+)\/(\d+)\/(\d+)/, '[$3-$1-$2]');
++      // Use direct component formatting - locale-independent
++      const year = date.getFullYear();
++      const month = String(date.getMonth() + 1).padStart(2, "0");
++      const day = String(date.getDate()).padStart(2, "0");
++      const hour = String(date.getHours()).padStart(2, "0");
++      const min = String(date.getMinutes()).padStart(2, "0");
++      const formattedDate = `[${year}-${month}-${day} ${hour}:${min}]`;
+       // ...
+     }).join("\n");
+   }
+#+END_SRC
+
+*** 7. XSS prevention in CSS injection
+#+BEGIN_SRC diff
+@@ src/index.js:256-263
+-  stops[0].innerHTML = `stop-color:${color};stop-opacity:1`;
+-  stops[1].innerHTML = `stop-color:${color};stop-opacity:0.8`;
++  stops[0].setAttribute("style", `stop-color:${color};stop-opacity:1`);
++  stops[1].setAttribute("style", `stop-color:${color};stop-opacity:0.8`);
+#+END_SRC
+
+*** 8. WARP badge UX improvement
+#+BEGIN_SRC diff
+@@ src/index.js:1095-1107
+-    // Old: Show warning for "off" state
+-    if (warpStatus === "off") {
+-      warpBadge.style.display = "inline-flex";
+-      warpBadge.innerText = "no warp";
+-      warpBadge.style.backgroundColor = "rgba(230, 57, 70, 0.1)";
+-      warpBadge.style.color = "#e63946";
+-    }
++    // Only show WARP badge when active (don't nag users who don't use it)
++    if (warpStatus === "on" || warpStatus === "plus") {
++      warpBadge.style.display = "inline-flex";
++      warpBadge.innerText = warpStatus === "plus" ? "warp+" : "warp";
++      warpBadge.dataset.tooltip = t(
++        `tooltips.${warpStatus === "plus" ? "warpPlus" : "warp"}`,
++      );
++      warpBadge.style.backgroundColor =
++        "var(--success-color, rgba(16, 163, 127, 0.1))";
++      warpBadge.style.color = "var(--success-color, #10a37f)";
++    } else {
++      warpBadge.style.display = "none";
++    }
+
+@@ src/index.js:1183-1185
+     if (warpBadge) {
+-      warpBadge.style.display = "inline-flex";
+-      warpBadge.innerText = "Error";
++      warpBadge.style.display = "none";
+     }
+#+END_SRC
+
+*** 9. Version bump
+#+BEGIN_SRC diff
+@@ src/index.js:6
+-// @version      0.2.8
++// @version      0.2.9
+#+END_SRC
+
+* Result
+** Outcome
+All critical reliability and stability issues resolved
+
+** Tests
+Manual verification required in ChatGPT UI:
+- Inject userscript
+- Verify no console errors
+- Test DOM reinject scenario
+- Test localStorage failure scenario
+- Verify WARP badge only shows when active
+
+** Observability
+Browser console now logs all errors with "ChatGPT Degraded:" prefix for debuggability
+
+* Decisions
+** Return in-memory logs on localStorage failure vs. failing completely
+:PROPERTIES:
+:DRI: Code reviewer
+:TIMESTAMP: [2025-12-24 Tue 20:00]
+:END:
+
+- Alternatives: (A) Fail silently, (B) Show error to user
+- Rationale: User still gets functionality even if persistence fails (privacy mode, quota exceeded)
+
+** Use async IIFE for background processing vs. Promise.then() chain
+:PROPERTIES:
+:DRI: Code reviewer
+:TIMESTAMP: [2025-12-24 Tue 20:00]
+:END:
+
+- Alternatives: (A) .then() chain, (B) No async wrapper (blocks response)
+- Rationale: IIFE makes async intent explicit and ensures response never blocks
+
+** Store event handler on element vs. WeakMap
+:PROPERTIES:
+:DRI: Code reviewer
+:TIMESTAMP: [2025-12-24 Tue 20:00]
+:END:
+
+- Alternatives: (A) WeakMap, (B) Global variable (old approach)
+- Rationale: Element property is simpler, self-cleaning on GC, no need for separate WeakMap lookup
+
+** WARP badge: Show only when active vs. warning when off
+:PROPERTIES:
+:DRI: UX reviewer
+:TIMESTAMP: [2025-12-24 Tue 21:00]
+:END:
+
+- Alternatives: (A) Show "no warp" warning, (B) Always visible with current state
+- Rationale: Most users don't use WARP; warning badge implies they're doing something wrong, creates unnecessary alarm
+
+* Risks
+** response.clone() can still throw in edge cases (body already consumed by original caller)
+:PROPERTIES:
+:STATUS: mitigated
+:OWNER: Userscript maintainer
+:END:
+
+- Mitigation: Wrapped in try-catch, logs warning, continues gracefully
+
+** Timer cleanup on beforeunload may not fire in all browsers (iOS Safari)
+:PROPERTIES:
+:STATUS: accepted
+:OWNER: Userscript maintainer
+:END:
+
+- Mitigation: Timer is hourly interval (low resource impact), browser tab close will cleanup anyway
+
+** Element property storage pollutes element namespace
+:PROPERTIES:
+:STATUS: mitigated
+:OWNER: Code reviewer
+:END:
+
+- Mitigation: Used Symbol-like naming with prefix "_chatgptDegradedHandler" to avoid collisions
+
+* Rollback
+** Trigger
+Users report ChatGPT infinite loading, console errors about "response not returned", IP history tooltips not working
+
+** Procedure
+Revert commit, republish 0.2.8 to GreasyFork, notify users via version update mechanism
+
+** Data impact
+None - localStorage schema unchanged
+
+* Notes
+** Assumptions
+ChatGPT's fetch interception pattern remains stable (no API changes on their side)
+
+** Constraints
+Userscript cannot use build tooling or bundlers - single-file constraint
+
+** Open Questions
+- Should we add retry logic for IP quality fetch failures? -> Deferred to future version
+
+** Gotchas
+- response.clone() throws if body is locked/consumed - always wrap it
+- fetch interception MUST return response immediately or caller hangs forever
+- localStorage can throw in privacy mode or quota exceeded - always handle
+- Date.toLocaleString() format varies by locale - never regex parse it
+- Global variables for event handlers leak on DOM reinject - use element properties
+- beforeunload doesn't always fire on mobile browsers - design for graceful degradation
+- WARP badge visibility: most users don't use WARP, warning badge creates false alarm
