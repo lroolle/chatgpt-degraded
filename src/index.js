@@ -3,7 +3,7 @@
 // @name:zh-CN   ChatGPT 服务降级监控
 // @name:zh-TW   ChatGPT 服務降級監控
 // @namespace    https://github.com/lroolle/chatgpt-degraded
-// @version      0.2.8
+// @version      0.2.9
 // @description  Monitor ChatGPT service level, IP quality and PoW difficulty
 // @description:zh-CN  监控 ChatGPT 服务状态、IP 质量和 PoW 难度
 // @description:zh-TW  監控 ChatGPT 服務狀態、IP 質量和 PoW 難度
@@ -11,8 +11,13 @@
 // @license      AGPL-3.0
 // @match        *://chat.openai.com/*
 // @match        *://chatgpt.com/*
+// @connect      chatgpt.com
+// @connect      chat.openai.com
 // @connect      status.openai.com
 // @connect      scamalytics.com
+// @connect      cloudflare.com
+// @connect      www.cloudflare.com
+// @connect      ipinfo.io
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @run-at       document-start
@@ -27,6 +32,48 @@
   "use strict";
 
   let displayBox, collapsedIndicator;
+  let monitoringStarted = false;
+  let reinjectObserverStarted = false;
+  let themeObserverStarted = false;
+  let statusCheckTimer = null;
+  let reinjectScheduled = false;
+
+  // Store handler on element to avoid global pollution and memory leaks
+  const HANDLER_KEY = "_chatgptDegradedHandler";
+
+  const UI_IDS = {
+    display: "chatgpt-degraded-display",
+    indicator: "chatgpt-degraded-indicator",
+  };
+
+  function isConnected(el) {
+    return !!(el && el.isConnected);
+  }
+
+  function ensureUIElements() {
+    if (isConnected(displayBox) && isConnected(collapsedIndicator)) return true;
+
+    displayBox = document.getElementById(UI_IDS.display);
+    collapsedIndicator = document.getElementById(UI_IDS.indicator);
+
+    if (isConnected(displayBox) && isConnected(collapsedIndicator)) return true;
+    if (!document.body) return false;
+
+    createUIElements();
+    return isConnected(displayBox) && isConnected(collapsedIndicator);
+  }
+
+  function scheduleReinject() {
+    if (reinjectScheduled) return;
+    reinjectScheduled = true;
+    setTimeout(() => {
+      reinjectScheduled = false;
+      if (!document.body) return;
+      if (document.getElementById(UI_IDS.display)) return;
+      createUIElements();
+      updateTheme();
+    }, 250);
+  }
 
   const i18n = {
     en: {
@@ -206,89 +253,119 @@
         );
       }
 
-      // Update color
+      // Update gradient color using DOM methods (avoid innerHTML with dynamic values)
       if (gradientStops) {
-        gradientStops.innerHTML = `
-          <stop offset="0%" style="stop-color:${color};stop-opacity:1" />
-          <stop offset="100%" style="stop-color:${color};stop-opacity:0.8" />
-        `;
+        const stops = gradientStops.querySelectorAll("stop");
+        if (stops.length >= 2) {
+          stops[0].setAttribute("style", `stop-color:${color};stop-opacity:1`);
+          stops[1].setAttribute("style", `stop-color:${color};stop-opacity:0.8`);
+        }
       }
     }
   }
 
-  const originalFetch = unsafeWindow.fetch;
-  unsafeWindow.fetch = async function (resource, options) {
-    const response = await originalFetch(resource, options);
-    const url = typeof resource === "string" ? resource : resource?.url;
-    // console.log("Fetch URL:", url);
-    // console.log("Fetch options:", options);
-
-    const isChatRequirements =
-      url &&
-      (url.includes("/backend-api/sentinel/chat-requirements") ||
-        url.includes("/backend-anon/sentinel/chat-requirements") ||
-        url.includes("/api/sentinel/chat-requirements"));
-
-    // const method = options?.method?.toUpperCase() || "GET";
-    // console.log("Method:", method, "isChatRequirements URL match:", isChatRequirements);
-
-    // Check if this is a chat requirements request (regardless of method for now)
-    if (isChatRequirements) {
-      // console.log("Processing chat requirements request with method:", method);
+  // Guard: ensure unsafeWindow.fetch exists before patching
+  if (!unsafeWindow.fetch) {
+    console.error("ChatGPT Degraded: unsafeWindow.fetch not available");
+  } else {
+    const originalFetch = unsafeWindow.fetch;
+    unsafeWindow.fetch = async function (resource, options) {
+      let response;
       try {
-        const clonedResponse = response.clone();
-        const data = await clonedResponse.json();
-        // console.log("Chat requirements response data:", data);
-        const difficulty = data?.proofofwork?.difficulty;
-        const userType = data?.persona || data?.user_type || data?.account_type;
-        const difficultyElement = document.getElementById("difficulty");
-        if (difficultyElement) {
-          if (difficulty) {
-            difficultyElement.innerText = difficulty;
-            difficultyElement.dataset.tooltip = `Raw Difficulty Value: ${difficulty}`;
-            // Update IP log with new PoW difficulty
-            const ipElement = document.getElementById("ip-address");
-            if (ipElement) {
-              const fullIP = ipElement.dataset.fullIp;
-              const ipQualityElement = document.getElementById("ip-quality");
-              const score = ipQualityElement
-                ? parseInt(ipQualityElement.dataset.score)
-                : null;
-              if (fullIP) {
-                const logs = addIPLog(fullIP, score, difficulty);
-                const formattedLogs = formatIPLogs(logs);
-                const ipContainerTooltip = [
-                  "IP History (recent 10):",
-                  formattedLogs,
-                  "\n---",
-                  "Click to copy history",
-                ].join("\n");
-                ipElement.dataset.tooltip = ipContainerTooltip;
-              }
-            }
-          } else {
-            difficultyElement.innerText = "N/A";
-            difficultyElement.dataset.tooltip = "No difficulty value found";
-          }
-        }
-        updateUserType(userType || "free");
-        updateProgressBars(difficulty || "N/A");
-      } catch (error) {
-        console.error("Error processing chat requirements:", error);
-        const difficultyElement = document.getElementById("difficulty");
-        if (difficultyElement) {
-          difficultyElement.innerText = "N/A";
-          difficultyElement.dataset.tooltip = `Error: ${error.message}`;
-        }
-        updateUserType("free");
-        updateProgressBars("N/A");
+        response = await originalFetch.call(this, resource, options);
+      } catch (fetchErr) {
+        throw fetchErr; // Re-throw original fetch errors, don't break ChatGPT
       }
-    }
-    return response;
-  };
 
-  function initUI() {
+      const url = typeof resource === "string" ? resource : resource?.url;
+      const isChatRequirements =
+        url &&
+        (url.includes("/backend-api/sentinel/chat-requirements") ||
+          url.includes("/backend-anon/sentinel/chat-requirements") ||
+          url.includes("/api/sentinel/chat-requirements"));
+
+      if (isChatRequirements) {
+        // Process in background - NEVER block the response
+        (async () => {
+          try {
+            ensureUIElements();
+            // Guard response.clone() - can throw if body is locked
+            let clonedResponse;
+            try {
+              clonedResponse = response.clone();
+            } catch (cloneErr) {
+              console.warn("ChatGPT Degraded: Could not clone response:", cloneErr.message);
+              return;
+            }
+            const contentType = clonedResponse.headers.get("content-type") || "";
+            if (!contentType.includes("application/json")) return;
+
+            const data = await clonedResponse.json();
+            const difficulty = data?.proofofwork?.difficulty;
+            const userType = data?.persona || data?.user_type || data?.account_type;
+            const difficultyElement = document.getElementById("difficulty");
+            const hasDifficulty = typeof difficulty === "string" && difficulty.length;
+
+            if (difficultyElement && hasDifficulty) {
+              difficultyElement.innerText = difficulty;
+              difficultyElement.dataset.tooltip = `Raw Difficulty Value: ${difficulty}`;
+              const ipElement = document.getElementById("ip-address");
+              if (ipElement) {
+                const fullIP = ipElement.dataset.fullIp;
+                const ipQualityElement = document.getElementById("ip-quality");
+                const score = ipQualityElement
+                  ? parseInt(ipQualityElement.dataset.score, 10)
+                  : null;
+                if (fullIP) {
+                  const logs = addIPLog(fullIP, score, difficulty);
+                  if (logs.length) {
+                    const formattedLogs = formatIPLogs(logs);
+                    ipElement.dataset.tooltip = [
+                      t("tooltips.ipHistory"),
+                      formattedLogs,
+                      "\n---",
+                      t("tooltips.clickToCopy"),
+                    ].join("\n");
+                  }
+                }
+              }
+            } else if (difficultyElement && !difficultyElement.innerText) {
+              difficultyElement.innerText = "N/A";
+              difficultyElement.dataset.tooltip = "No difficulty value found";
+            }
+            if (userType) updateUserType(userType);
+            if (hasDifficulty) updateProgressBars(difficulty);
+          } catch (error) {
+            console.error("ChatGPT Degraded: Error processing chat requirements:", error);
+            const difficultyElement = document.getElementById("difficulty");
+            if (difficultyElement && !difficultyElement.innerText) {
+              difficultyElement.innerText = "N/A";
+              difficultyElement.dataset.tooltip = `Error: ${error.message}`;
+              updateProgressBars("N/A");
+            }
+          }
+        })();
+      }
+
+      return response; // ALWAYS return immediately
+    };
+  }
+
+  function createUIElements() {
+    const existingDisplay = document.getElementById(UI_IDS.display);
+    const existingIndicator = document.getElementById(UI_IDS.indicator);
+    if (existingDisplay && existingIndicator) {
+      displayBox = existingDisplay;
+      collapsedIndicator = existingIndicator;
+      return;
+    }
+
+    if (!document.body) return;
+    if (existingDisplay) existingDisplay.remove();
+    if (existingIndicator) existingIndicator.remove();
+
     displayBox = document.createElement("div");
+    displayBox.id = UI_IDS.display;
     displayBox.style.position = "fixed";
     displayBox.style.bottom = "10px";
     displayBox.style.right = "55px";
@@ -567,6 +644,7 @@
     document.body.appendChild(displayBox);
 
     collapsedIndicator = document.createElement("div");
+    collapsedIndicator.id = UI_IDS.indicator;
     collapsedIndicator.style.position = "fixed";
     collapsedIndicator.style.bottom = "10px";
     collapsedIndicator.style.right = "15px";
@@ -642,26 +720,60 @@
         displayBox.style.display = "none";
       }, 150);
     });
+  }
 
-    const observer = new MutationObserver(updateTheme);
-    observer.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["class"],
-    });
+  function initUI() {
+    createUIElements();
+    if (!ensureUIElements()) return;
 
-    fetchIPInfo();
-    fetchChatGPTStatus();
     updateTheme();
-    const statusCheckInterval = 60 * 60 * 1000;
-    let statusCheckTimer = setInterval(fetchChatGPTStatus, statusCheckInterval);
 
-    document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible") {
-        clearInterval(statusCheckTimer);
-        fetchChatGPTStatus();
-        statusCheckTimer = setInterval(fetchChatGPTStatus, statusCheckInterval);
-      }
-    });
+    if (!themeObserverStarted) {
+      themeObserverStarted = true;
+      const observer = new MutationObserver(updateTheme);
+      observer.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ["class"],
+      });
+    }
+
+    if (!reinjectObserverStarted) {
+      reinjectObserverStarted = true;
+      const observer = new MutationObserver(() => {
+        if (!document.getElementById(UI_IDS.display)) scheduleReinject();
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    if (!monitoringStarted) {
+      monitoringStarted = true;
+      fetchIPInfo().catch((err) => console.error("ChatGPT Degraded: IP fetch failed:", err));
+      fetchChatGPTStatus().catch((err) => console.error("ChatGPT Degraded: Status fetch failed:", err));
+
+      const statusCheckInterval = 60 * 60 * 1000;
+      statusCheckTimer = setInterval(
+        () => fetchChatGPTStatus().catch((err) => console.error("ChatGPT Degraded: Status check failed:", err)),
+        statusCheckInterval,
+      );
+
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState !== "visible") return;
+        if (statusCheckTimer) clearInterval(statusCheckTimer);
+        fetchChatGPTStatus().catch((err) => console.error("ChatGPT Degraded: Status fetch failed:", err));
+        statusCheckTimer = setInterval(
+          () => fetchChatGPTStatus().catch((err) => console.error("ChatGPT Degraded: Status check failed:", err)),
+          statusCheckInterval,
+        );
+      });
+
+      // Cleanup timer on page unload
+      window.addEventListener("beforeunload", () => {
+        if (statusCheckTimer) {
+          clearInterval(statusCheckTimer);
+          statusCheckTimer = null;
+        }
+      });
+    }
   }
 
   if (document.readyState !== "loading") {
@@ -817,41 +929,37 @@
   }
 
   function addIPLog(ip, score, difficulty) {
-    try {
-      const logs = getIPLogs();
-      const timestamp = new Date().toISOString();
-      const newLog = { timestamp, ip, score, difficulty };
-      if (logs.length > 0 && logs[0].ip === ip) {
-        logs[0] = newLog;
-      } else {
-        logs.unshift(newLog);
-      }
-      const trimmedLogs = logs.slice(0, 10);
-      localStorage.setItem("chatgpt_ip_logs", JSON.stringify(trimmedLogs));
-      return trimmedLogs;
-    } catch (error) {
-      console.error("Error adding IP log:", error);
-      return [];
+    const logs = getIPLogs();
+    const timestamp = new Date().toISOString();
+    const newLog = { timestamp, ip, score, difficulty };
+    if (logs.length > 0 && logs[0].ip === ip) {
+      logs[0] = newLog;
+    } else {
+      logs.unshift(newLog);
     }
+    const trimmedLogs = logs.slice(0, 10);
+    try {
+      localStorage.setItem("chatgpt_ip_logs", JSON.stringify(trimmedLogs));
+    } catch (error) {
+      // localStorage might be full or disabled (privacy mode)
+      console.warn("ChatGPT Degraded: Could not save IP log:", error.message);
+      // Return in-memory logs anyway so UI still works
+    }
+    return trimmedLogs;
   }
 
   function formatIPLogs(logs) {
     return logs
       .map((log) => {
         const date = new Date(log.timestamp);
-        const formattedDate = date
-          .toLocaleString("en-US", {
-            year: "numeric",
-            month: "2-digit",
-            day: "2-digit",
-            hour: "2-digit",
-            minute: "2-digit",
-            hour12: false,
-          })
-          .replace(/(\d+)\/(\d+)\/(\d+),\s(\d+):(\d+)/, "[$3-$1-$2 $4:$5]");
-        const { color: powColor, level: powLevel } = getRiskColorAndLevel(
-          log.difficulty,
-        );
+        // Use direct component formatting - locale-independent
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, "0");
+        const day = String(date.getDate()).padStart(2, "0");
+        const hour = String(date.getHours()).padStart(2, "0");
+        const min = String(date.getMinutes()).padStart(2, "0");
+        const formattedDate = `[${year}-${month}-${day} ${hour}:${min}]`;
+        const { level: powLevel } = getRiskColorAndLevel(log.difficulty);
         const scoreDisplay =
           log.score !== null && log.score !== undefined ? log.score : "N/A";
         return `${formattedDate} ${log.ip}(${scoreDisplay}), ${log.difficulty || "N/A"}(${powLevel})`;
@@ -860,6 +968,7 @@
   }
 
   async function fetchIPInfo() {
+    ensureUIElements();
     const fallbackServices = [
       {
         url: "https://chatgpt.com/cdn-cgi/trace",
@@ -965,12 +1074,15 @@
   }
 
   async function updateIPDisplay(data) {
+    if (!ensureUIElements()) return;
+
     const ipElement = document.getElementById("ip-address");
     const warpBadge = document.getElementById("warp-badge");
     const ipQualityElement = document.getElementById("ip-quality");
 
     if (!ipElement || !warpBadge || !ipQualityElement) {
-      throw new Error("IP display elements not found");
+      scheduleReinject();
+      return;
     }
 
     const maskedIP = maskIP(data.ip);
@@ -1030,7 +1142,11 @@
       ipQualityElement.onclick = () =>
         window.open(`https://scamalytics.com/ip/${fullIP}`, "_blank");
 
-      const copyHandler = async () => {
+      // Remove old handler if exists (stored on element to avoid global pollution)
+      if (ipElement[HANDLER_KEY]) {
+        ipElement.removeEventListener("click", ipElement[HANDLER_KEY]);
+      }
+      ipElement[HANDLER_KEY] = async () => {
         try {
           const logs = getIPLogs();
           const formattedHistory = formatIPLogs(logs);
@@ -1041,7 +1157,7 @@
             ipElement.innerText = originalText;
           }, 1000);
         } catch (err) {
-          console.error("Copy failed:", err);
+          console.error("ChatGPT Degraded: Copy failed:", err);
           const originalText = ipElement.innerText;
           ipElement.innerText = t("copyFailed");
           setTimeout(() => {
@@ -1049,9 +1165,7 @@
           }, 1000);
         }
       };
-
-      ipElement.removeEventListener("click", copyHandler);
-      ipElement.addEventListener("click", copyHandler);
+      ipElement.addEventListener("click", ipElement[HANDLER_KEY]);
     } catch (qualityError) {
       console.error("Failed to fetch IP quality:", qualityError);
       ipQualityElement.innerText = "Quality check failed";
@@ -1096,6 +1210,7 @@
       if (typeof GM_xmlhttpRequest === "undefined") {
         throw new Error("GM_xmlhttpRequest not supported");
       }
+      if (!ensureUIElements()) return;
       return new Promise((resolve, reject) => {
         GM_xmlhttpRequest({
           method: "GET",
@@ -1112,7 +1227,8 @@
                 const statusMonitorItem =
                   statusDescription?.closest(".monitor-item");
                 if (!statusDescription || !statusMonitorItem) {
-                  reject(new Error("Status UI elements not found"));
+                  scheduleReinject();
+                  resolve();
                   return;
                 }
                 statusMonitorItem.style.display = "block";
@@ -1154,6 +1270,7 @@
   }
 
   function updateTheme() {
+    if (!ensureUIElements()) return;
     const isDark =
       document.documentElement.classList.contains("dark") ||
       localStorage.getItem("theme") === "dark" ||
